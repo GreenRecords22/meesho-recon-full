@@ -1,0 +1,11 @@
+{
+  "meesho_default": {
+    "order_id_col": "Sub Order No",
+    "order_amount_col": "Supplier Discounted Price (Incl GST and Commision)",
+    "order_date_col": "Order Date",
+    "payment_orderid_col": null,
+    "payment_amount_col": null,
+    "payment_date_col": null,
+    "commission_col": null
+  }
+}
