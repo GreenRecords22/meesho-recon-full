@@ -1,199 +1,233 @@
-import importlib, utils
-importlib.reload(utils)
-from utils import fuzzy_match_orders_to_payments, group_orders_by_batch_and_match
 
 import streamlit as st
-import pandas as pd, io, re, os, json
-import altair as alt
+import pandas as pd, io, os, importlib
 from datetime import datetime
-from utils import parse_amount, fuzzy_match_orders_to_payments, group_orders_by_batch_and_match
+import altair as alt
 
-st.set_page_config(page_title="Meesho Recon — Full", layout="wide")
-st.title("Meesho Reconciliation & Insights — Full Edition")
+# reload utils to avoid stale cache on Streamlit Cloud
+import utils
+importlib.reload(utils)
+from utils import fuzzy_match_orders_to_payments, group_orders_by_batch_and_match, parse_amount
 
-# Load presets
-PRESETS_PATH = "presets.json"
-if os.path.exists(PRESETS_PATH):
-    with open(PRESETS_PATH, "r", encoding="utf-8") as f:
-        PRESETS = json.load(f)
-else:
-    PRESETS = {}
+st.set_page_config(page_title="Meesho Recon — Advanced", layout="wide")
+st.title("Meesho Payment Reconciliation — Advanced Dashboard")
 
-# Sidebar for features
-st.sidebar.header("Quick Menu")
-mode = st.sidebar.selectbox("Mode", ["Reconciliation","Bank-statement Match","Profit & Loss","KPI Dashboard","Settings","About"])
+st.sidebar.header("Controls")
+mode = st.sidebar.selectbox("Mode", ["Reconciliation", "Analytics", "Bank-statement Match", "About"])
 
-# Optional simple auth via env variable (if set)
-PASSWORD = os.environ.get("MEESHO_RECON_PASS")
-if PASSWORD:
-    pw = st.sidebar.text_input("Password (env-protected)", type="password")
-    if pw != PASSWORD:
-        st.warning("Enter password to proceed")
+# Simple info
+if mode == "About":
+    st.markdown(\"\"\"
+    **Meesho Recon — Advanced**  
+    - Upload Orders & Payments (per-order) CSV/XLSX.  
+    - Advanced fuzzy reconciliation + analytics.  
+    - Bank-statement batch matching for aggregated payouts.  
+    \"\"\")
+
+# RECONCILIATION
+if mode == "Reconciliation":
+    st.header("Reconciliation (per-order)")
+    c1, c2 = st.columns([1,1])
+    with c1:
+        orders_file = st.file_uploader("Orders CSV/XLSX", type=["csv","xlsx"], key="o_file")
+    with c2:
+        payments_file = st.file_uploader("Payments CSV/XLSX (per-order settlements)", type=["csv","xlsx"], key="p_file")
+
+    st.markdown("**Options**")
+    tolerance = st.number_input("Amount tolerance (₹)", value=1.0, step=0.5)
+    date_filter = st.date_input("Show orders from date (optional)", value=None)
+    if isinstance(date_filter, list): # safety
+        date_filter = date_filter[0] if date_filter else None
+
+    if orders_file is None:
+        st.info("Upload Orders file to begin.")
         st.stop()
 
-if mode == "About":
-    st.markdown("Full-featured Meesho Reconciliation tool with presets, fuzzy matching, bank-statement reconciliation, KPIs and profit analytics.")
-
-if mode == "Settings":
-    st.subheader("Presets loaded")
-    st.json(PRESETS)
-    st.markdown("You can edit `presets.json` file to add more presets for different CSV layouts.")
-
-if mode == "Profit & Loss":
-    st.header("Profit & Loss (advanced)")
-    df = st.file_uploader("Upload Orders CSV to compute P&L by SKU (optional)", type=["csv","xlsx"])
-    if df is not None:
-        if str(df.name).lower().endswith(".xlsx"):
-            odf = pd.read_excel(df)
-        else:
-            odf = pd.read_csv(df, low_memory=False)
-        # ask for mapping
-        sku_col = st.selectbox("SKU column", ["--select--"] + list(odf.columns))
-        price_col = st.selectbox("Selling price column", ["--select--"] + list(odf.columns))
-        cost_col = st.selectbox("Cost price column", ["--select--"] + list(odf.columns))
-        if st.button("Compute P&L by SKU"):
-            odf['__selling__'] = odf[price_col].apply(parse_amount) if price_col!="--select--" else 0.0
-            odf['__cost__'] = odf[cost_col].apply(parse_amount) if cost_col!="--select--" else 0.0
-            report = odf.groupby(sku_col).agg(total_qty=('Quantity','sum'), revenue=('__selling__','sum'), cost=('__cost__','sum')).reset_index()
-            report['profit'] = report['revenue'] - report['cost']
-            st.dataframe(report.sort_values('profit', ascending=False).head(50))
-            st.download_button("Download P&L XLSX", data=to_excel_bytes(report), file_name="pl_by_sku.xlsx")
-
-if mode == "Reconciliation":
-    st.header("Per-order Reconciliation (fuzzy + presets)")
-    col1, col2 = st.columns(2)
-    with col1:
-        orders_file = st.file_uploader("Orders CSV/XLSX (per-order)", type=["csv","xlsx"], key="o1")
-    with col2:
-        payments_file = st.file_uploader("Payments CSV/XLSX (per-order settlements)", type=["csv","xlsx"], key="p1")
-
-    preset_choice = st.selectbox("Apply preset", ["--none--"] + list(PRESETS.keys()))
-    if preset_choice != "--none--":
-        preset = PRESETS[preset_choice]
+    # load orders
+    if str(orders_file.name).lower().endswith(".xlsx"):
+        orders_df = pd.read_excel(orders_file)
     else:
-        preset = {}
+        orders_df = pd.read_csv(orders_file, low_memory=False)
 
-    if orders_file is not None:
-        if str(orders_file.name).lower().endswith(".xlsx"):
-            o = pd.read_excel(orders_file)
-        else:
-            o = pd.read_csv(orders_file, low_memory=False)
-        st.write("Orders rows:", o.shape[0])
-        st.dataframe(o.head(6))
-    else:
-        o = None
-
+    # load payments
     if payments_file is not None:
         if str(payments_file.name).lower().endswith(".xlsx"):
-            p = pd.read_excel(payments_file)
+            payments_df = pd.read_excel(payments_file)
         else:
-            p = pd.read_csv(payments_file, low_memory=False)
-        st.write("Payments rows:", p.shape[0])
-        st.dataframe(p.head(6))
+            payments_df = pd.read_csv(payments_file, low_memory=False)
     else:
-        p = None
+        payments_df = pd.DataFrame()
 
-    # detect defaults
-    def find_in(cols, name):
-        for c in cols:
-            if name and name.lower() in c.lower():
-                return c
+    st.subheader("Preview: Orders (first 5 rows)")
+    st.dataframe(orders_df.head(5))
+    st.subheader("Preview: Payments (first 5 rows)")
+    st.dataframe(payments_df.head(5))
+
+    # Ask mapping or try autodetect
+    st.markdown("### Column mapping (auto-detected if possible)")
+    cols_o = list(orders_df.columns)
+    cols_p = list(payments_df.columns) if not payments_df.empty else []
+
+    # heuristics names
+    def find_like(cols, keywords):
+        for k in keywords:
+            for c in cols:
+                if k.lower() in c.lower():
+                    return c
         return None
 
-    possible_order_cols = list(o.columns) if o is not None else []
-    possible_pay_cols = list(p.columns) if p is not None else []
+    order_id_col = find_like(cols_o, ["sub order","order id","sub order no","packet id","order no"]) or st.selectbox("Order ID column (orders)", ["--auto--"]+cols_o, index=0)
+    order_amount_col = find_like(cols_o, ["supplier discounted price","supplier listed price","amount","price","order value"]) or st.selectbox("Order Amount column (orders)", ["--auto--"]+cols_o, index=0)
+    order_date_col = find_like(cols_o, ["order date","date"]) or st.selectbox("Order Date column (orders)", ["--auto--"]+cols_o, index=0)
 
-    order_id_col = find_in(possible_order_cols, preset.get("order_id_col")) or st.selectbox("Order ID column", ["--select--"] + possible_order_cols)
-    order_amount_col = find_in(possible_order_cols, preset.get("order_amount_col")) or st.selectbox("Order Amount column", ["--select--"] + possible_order_cols)
-    payment_id_col = find_in(possible_pay_cols, preset.get("payment_orderid_col")) or st.selectbox("Payment Order ID column", ["--select--"] + possible_pay_cols)
-    payment_amount_col = find_in(possible_pay_cols, preset.get("payment_amount_col")) or st.selectbox("Payment Amount column", ["--select--"] + possible_pay_cols)
+    payment_id_col = find_like(cols_p, ["order id","sub order","packet id"]) or st.selectbox("Order ID column (payments)", ["--auto--"]+cols_p, index=0)
+    payment_amount_col = find_like(cols_p, ["amount","paid","credited","settlement"]) or st.selectbox("Amount column (payments)", ["--auto--"]+cols_p, index=0)
+    commission_col = find_like(cols_p, ["commission","fee","charge"]) or st.selectbox("Commission column (payments)", ["--auto--"]+cols_p, index=0)
 
-    tolerance = st.number_input("Amount tolerance (₹)", value=1.0)
-    if st.button("Run advanced reconciliation"):
-        if o is None:
-            st.error("Upload orders file first")
-        else:
-            o2 = o.copy()
-            p2 = p.copy() if p is not None else pd.DataFrame()
-            # standardize
-            if isinstance(order_id_col, str) and order_id_col!="--select--":
-                o2['__order_id__'] = o2[order_id_col].astype(str).str.strip()
-            else:
-                o2['__order_id__'] = o2.index.astype(str)
-            if isinstance(order_amount_col, str) and order_amount_col!="--select--":
-                o2['__order_amount__'] = o2[order_amount_col].apply(parse_amount)
-            else:
-                o2['__order_amount__'] = 0.0
-            if p is not None and isinstance(payment_id_col, str) and payment_id_col!="--select--":
-                p2['__payment_orderid__'] = p2[payment_id_col].astype(str).str.strip()
-            if p is not None and isinstance(payment_amount_col, str) and payment_amount_col!="--select--":
-                p2['__amount_received__'] = p2[payment_amount_col].apply(parse_amount)
-            # run fuzzy matcher
-            merged = fuzzy_match_orders_to_payments(o2, p2, order_id_col='__order_id__', amount_col_o='__order_amount__', payment_amount_col='__amount_received__', payment_id_col='__payment_orderid__', amount_tolerance=tolerance)
-            merged['__diff__'] = merged['__amount_received__'].fillna(0.0) - merged['__order_amount__'].fillna(0.0)
-            st.subheader("Summary")
-            st.write("Total orders:", o2.shape[0])
-            st.write("Total payments rows:", p2.shape[0] if p is not None else 0)
-            st.write("Matched (direct or fuzzy):", merged[merged['match_type']!='unmatched'].shape[0])
-            st.write("Unmatched:", merged[merged['match_type']=='unmatched'].shape[0])
-            st.dataframe(merged.head(200))
-            # download
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                merged.to_excel(writer, index=False, sheet_name="Detail")
-            buf.seek(0)
-            st.download_button("Download advanced reconciliation", buf, file_name="meesho_recon_full.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    # Normalize chosen values: if auto found returns string; if user selected, selection is string
+    if order_id_col == "--auto--": order_id_col = find_like(cols_o, ["sub order","order id","sub order no","packet id","order no"]) or "__order_id__"
+    if order_amount_col == "--auto--": order_amount_col = find_like(cols_o, ["supplier discounted price","supplier listed price","amount","price","order value"]) or "__order_amount__"
+    if order_date_col == "--auto--": order_date_col = find_like(cols_o, ["order date","date"]) or None
 
+    if payment_id_col == "--auto--": payment_id_col = find_like(cols_p, ["order id","sub order","packet id"]) or "__payment_orderid__"
+    if payment_amount_col == "--auto--": payment_amount_col = find_like(cols_p, ["amount","paid","credited","settlement"]) or "__amount_received__"
+    if commission_col == "--auto--": commission_col = find_like(cols_p, ["commission","fee","charge"]) or None
+
+    # Prepare orders: ensure id and amount columns exist
+    orders_df_copy = orders_df.copy()
+    if order_id_col not in orders_df_copy.columns:
+        orders_df_copy["__order_id__"] = orders_df_copy.index.astype(str)
+    else:
+        orders_df_copy["__order_id__"] = orders_df_copy[order_id_col].astype(str).str.strip()
+
+    if order_amount_col not in orders_df_copy.columns:
+        orders_df_copy["__order_amount__"] = 0.0
+    else:
+        orders_df_copy["__order_amount__"] = orders_df_copy[order_amount_col].apply(parse_amount)
+
+    # Prepare payments: ensure columns exist
+    payments_df_copy = payments_df.copy() if not payments_df.empty else pd.DataFrame()
+    if payment_id_col not in payments_df_copy.columns:
+        payments_df_copy["__payment_orderid__"] = payments_df_copy.index.astype(str)
+    else:
+        payments_df_copy["__payment_orderid__"] = payments_df_copy[payment_id_col].astype(str).str.strip()
+    if payment_amount_col not in payments_df_copy.columns:
+        payments_df_copy["__amount_received__"] = 0.0
+    else:
+        payments_df_copy["__amount_received__"] = payments_df_copy[payment_amount_col].apply(parse_amount)
+    if commission_col and commission_col in payments_df_copy.columns:
+        payments_df_copy["__commission__"] = payments_df_copy[commission_col].apply(parse_amount)
+    else:
+        payments_df_copy["__commission__"] = 0.0
+
+    # Optionally filter by date
+    if order_date_col and order_date_col in orders_df_copy.columns and st.checkbox("Filter by Order Date", value=False):
+        try:
+            orders_df_copy[order_date_col] = pd.to_datetime(orders_df_copy[order_date_col], errors="coerce")
+            start = st.date_input("Start date", value=None)
+            end = st.date_input("End date", value=None)
+            if start and end:
+                orders_df_copy = orders_df_copy[(orders_df_copy[order_date_col].dt.date >= start) & (orders_df_copy[order_date_col].dt.date <= end)]
+        except Exception as e:
+            st.warning("Could not parse order dates: " + str(e))
+
+    # Run advanced fuzzy reconciliation
+    merged = fuzzy_match_orders_to_payments(
+        orders_df_copy,
+        payments_df_copy,
+        order_id_col="__order_id__",
+        amount_col_o="__order_amount__",
+        payment_amount_col="__amount_received__",
+        payment_id_col="__payment_orderid__",
+        amount_tolerance=tolerance,
+    )
+
+    # Analytics
+    total_orders = len(orders_df_copy)
+    total_payments = len(payments_df_copy)
+    matched_direct = (merged["match_type"] == "direct_id").sum()
+    matched_amount = merged["match_type"].str.contains("amount_greedy").sum()
+    matched_fuzzy = merged["match_type"].str.contains("fuzzy_id").sum()
+    unmatched = (merged["match_type"] == "unmatched").sum()
+
+    st.subheader("Summary Metrics")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Orders", total_orders)
+    c2.metric("Total Payments (rows)", total_payments)
+    c3.metric("Matched %", f"{(matched_direct+matched_amount+matched_fuzzy)/max(1,total_orders)*100:.1f}%")
+    # compute payout diff: sum(amount_received) - sum(order_amount)
+    payout_diff = merged["__amount_received__"].fillna(0).sum() - merged["__order_amount__"].fillna(0).sum()
+    c4.metric("Total Payout Difference (₹)", f"{payout_diff:.2f}")
+
+    st.markdown("---")
+    st.subheader("Top issues / quick views")
+    st.write("Unmatched orders (sample):")
+    st.dataframe(merged[merged['match_type']=='unmatched'].head(50))
+
+    st.markdown("---")
+    st.subheader("Detailed table (first 500 rows)")
+    st.dataframe(merged.head(500))
+
+    # Export Excel
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        merged.to_excel(writer, index=False, sheet_name="Reconciliation_Detail")
+        pd.DataFrame([
+            {"Metric": "Total Orders", "Value": total_orders},
+            {"Metric": "Total Payments (rows)", "Value": total_payments},
+            {"Metric": "Matched (direct)", "Value": int(matched_direct)},
+            {"Metric": "Matched (amount)", "Value": int(matched_amount)},
+            {"Metric": "Matched (fuzzy)", "Value": int(matched_fuzzy)},
+            {"Metric": "Unmatched", "Value": int(unmatched)},
+            {"Metric": "Payout Difference (₹)", "Value": f"{payout_diff:.2f}"},
+            {"Metric": "Exported At", "Value": datetime.now().isoformat()}
+        ]).to_excel(writer, index=False, sheet_name="Summary")
+    buffer.seek(0)
+    st.download_button("⬇️ Download Reconciliation Excel", buffer, file_name="meesho_reconciliation_advanced.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+# BANK STATEMENT MATCH
 if mode == "Bank-statement Match":
-    st.header("Bank-statement / Payout-batch fuzzy matcher")
-    orders_file = st.file_uploader("Orders CSV/XLSX (per-order)", type=["csv","xlsx"], key="bs_o")
-    bank_file = st.file_uploader("Bank statement / Payout CSV/XLSX", type=["csv","xlsx"], key="bs_b")
-    if orders_file is not None and bank_file is not None:
+    st.header("Bank-statement / Payout-batch Matcher")
+    bf1, bf2 = st.columns(2)
+    with bf1:
+        orders_file = st.file_uploader("Orders CSV/XLSX", type=["csv","xlsx"], key="bs_o")
+    with bf2:
+        bank_file = st.file_uploader("Bank Statement / Payout CSV/XLSX", type=["csv","xlsx"], key="bs_b")
+    if orders_file and bank_file:
         if str(orders_file.name).lower().endswith(".xlsx"):
-            o = pd.read_excel(orders_file)
+            orders_df = pd.read_excel(orders_file)
         else:
-            o = pd.read_csv(orders_file, low_memory=False)
+            orders_df = pd.read_csv(orders_file, low_memory=False)
         if str(bank_file.name).lower().endswith(".xlsx"):
-            b = pd.read_excel(bank_file)
+            bank_df = pd.read_excel(bank_file)
         else:
-            b = pd.read_csv(bank_file, low_memory=False)
-        st.write("Orders rows:", o.shape[0], "Bank rows:", b.shape[0])
-        mapping = group_orders_by_batch_and_match(o, b, order_amount_col='Supplier Discounted Price (Incl GST and Commision)')
+            bank_df = pd.read_csv(bank_file, low_memory=False)
+        st.write("Running greedy batch match (heuristic) ...")
+        mapping = group_orders_by_batch_and_match(orders_df, bank_df, order_amount_col="Supplier Discounted Price (Incl GST and Commision)")
         st.json(mapping)
-        st.markdown("Note: this is a heuristic greedy grouping. Review results manually.")
+        st.markdown("Review mapping carefully; this is a greedy heuristic.")
 
-if mode == "KPI Dashboard":
-    st.header("KPIs & Charts")
-    st.markdown("Upload Orders CSV to compute KPIs (top SKUs, revenue trends)")
-    f = st.file_uploader("Orders CSV", type=["csv","xlsx"], key="kpi_o")
-    if f is not None:
+# ANALYTICS
+if mode == "Analytics":
+    st.header("Analytics & KPIs")
+    f = st.file_uploader("Upload Orders CSV for KPIs", type=["csv","xlsx"], key="kpi_o")
+    if f:
         if str(f.name).lower().endswith(".xlsx"):
             df = pd.read_excel(f)
         else:
             df = pd.read_csv(f, low_memory=False)
-        # Try find columns
         cols = list(df.columns)
-        sku = st.selectbox("SKU column", ["--select--"] + cols)
-        datec = st.selectbox("Date column", ["--select--"] + cols)
-        pricec = st.selectbox("Price/Sales column", ["--select--"] + cols)
+        sku = st.selectbox("SKU column", ["--select--"]+cols)
+        pricec = st.selectbox("Selling Price column", ["--select--"]+cols)
+        datec = st.selectbox("Date column", ["--select--"]+cols)
         if st.button("Generate KPIs"):
-            df['__price__'] = df[pricec].apply(parse_amount) if pricec!="--select--" else 0.0
-            df['__date__'] = pd.to_datetime(df[datec]) if datec!="--select--" else pd.to_datetime("today")
-            df['month'] = df['__date__'].dt.to_period("M").astype(str)
-            top = df.groupby(sku).agg(qty=('Quantity','sum'), revenue=('__price__','sum')).reset_index().sort_values('revenue', ascending=False).head(20)
-            st.subheader("Top SKUs by revenue")
+            df["__price__"] = df[pricec].apply(parse_amount) if pricec!="--select--" else 0.0
+            df["__date__"] = pd.to_datetime(df[datec], errors="coerce") if datec!="--select--" else pd.to_datetime("today")
+            df["month"] = df["__date__"].dt.to_period("M").astype(str)
+            top = df.groupby(sku).agg(qty=("Quantity","sum"), revenue=("__price__","sum")).reset_index().sort_values("revenue", ascending=False).head(50)
+            st.subheader("Top SKUs by Revenue")
             st.dataframe(top)
-            chart = alt.Chart(df.groupby('month').agg(rev=('__price__','sum')).reset_index()).mark_line(point=True).encode(x='month', y='rev')
+            chart_df = df.groupby("month").agg(rev=("__price__","sum")).reset_index()
+            chart = alt.Chart(chart_df).mark_line(point=True).encode(x="month", y="rev")
             st.altair_chart(chart, use_container_width=True)
-
-# helpers
-def to_excel_bytes(df):
-    import io
-    with io.BytesIO() as buf:
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False)
-        return buf.getvalue()
-
-# Footer
-st.markdown("---")
-st.caption("Full edition — includes fuzzy ID matching, greedy amount matching, bank-statement grouping, KPIs and P&L tools.")
